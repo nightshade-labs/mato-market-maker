@@ -15,7 +15,7 @@ import MatoIDL from "./idl/mato.json" with { type: "json" };
 import type { Mato } from "./types/mato.ts";
 
 process.env.ANCHOR_PROVIDER_URL = clusterApiUrl("devnet");
-process.env.ANCHOR_WALLET = os.homedir() + "/.config/solana/id.json";
+process.env.ANCHOR_WALLET = os.homedir() + "/.config/solana/mato.json";
 
 const exits = new PublicKey("D467xRNpNHvxbG7nRApDSshnvqVDhL4YjBYqz9TsoKF9");
 const prices = new PublicKey("Dpe9rm2NFSTowGbvrwXccbW7FtGfrQCdu6ogugNW6akK");
@@ -29,8 +29,121 @@ let usdcMint = new PublicKey("4zMMC9srt5Ri5X14GAgXhaHii3GnPAEERYPJgZJDncDU");
 
   const duration = 2000;
 
+  const [market] = PublicKey.findProgramAddressSync(
+    [Buffer.from("market"), exits.toBuffer(), prices.toBuffer()],
+    program.programId
+  );
+
 
   while (true) {
+    let currentSlot;
+    let allPositionsA;
+    let allPositionsB;
+
+    try {
+      currentSlot = await provider.connection.getSlot();
+      allPositionsA = await program.account.positionA.all([
+        {
+          memcmp: {
+            offset: 8, // discriminator
+            bytes: provider.publicKey.toBase58(),
+          },
+        },
+      ]);
+      allPositionsB = await program.account.positionB.all([
+        {
+          memcmp: {
+            offset: 8, // discriminator
+            bytes: provider.publicKey.toBase58(),
+          },
+        },
+      ]);
+    } catch(e) {
+      continue;
+    }
+
+    allPositionsA.forEach(async (position) => {
+        if (currentSlot - position.account.startSlot > duration / 4) {
+        const [positionAPda] = PublicKey.findProgramAddressSync(
+          [
+            Buffer.from("position_a"),
+            market.toBuffer(),
+            position.account.owner.toBuffer(),
+            position.account.id.toArrayLike(Buffer, "le", 8),
+          ],
+          program.programId
+        );
+
+        let usdcATA = getAssociatedTokenAddressSync(
+          usdcMint,
+          position.account.owner
+        );
+
+      try{
+        await program.methods
+          .withdrawSwappedTokenB()
+          .accountsPartial({
+            withdrawer: provider.publicKey,
+            withdrawerTokenAccount: usdcATA,
+            tokenMintB: usdcMint,
+            market: market,
+            positionA: positionAPda,
+            // bookkeeping: bookkeeping,
+            exits: exits,
+            prices: prices,
+            tokenProgram: TOKEN_PROGRAM_ID,
+          })
+          .rpc({ skipPreflight: true });
+
+          await new Promise((f) => setTimeout(f, 1000));
+        } catch (e) {
+          console.log("Error withdrawing tokens b:", e);
+        }
+      }
+
+    });
+
+    allPositionsB.forEach(async (position) => {
+      if (currentSlot - position.account.startSlot > duration / 4) {
+        const [positionBPda] = PublicKey.findProgramAddressSync(
+          [
+            Buffer.from("position_b"),
+            market.toBuffer(),
+            position.account.owner.toBuffer(),
+            position.account.id.toArrayLike(Buffer, "le", 8),
+          ],
+          program.programId
+        );
+
+        let solATA = getAssociatedTokenAddressSync(
+          solMint,
+          position.account.owner
+        );
+
+        try {
+        await program.methods
+          .withdrawSwappedTokenA()
+          .accountsPartial({
+            withdrawer: provider.publicKey,
+            withdrawerTokenAccount: solATA,
+            tokenMintA: solMint,
+            // market: market,
+            positionB: positionBPda,
+            // bookkeeping: bookkeeping,
+            exits: exits,
+            prices: prices,
+            tokenProgram: TOKEN_PROGRAM_ID,
+          })
+          .rpc({ skipPreflight: true });
+
+          await new Promise((f) => setTimeout(f, 1000));
+        } catch (e) {
+          console.log("Error withdrawing tokens a:", e);
+        }
+      }
+
+    });
+
 
     let usdcATA = getAssociatedTokenAddressSync(
       usdcMint,
@@ -95,10 +208,11 @@ let usdcMint = new PublicKey("4zMMC9srt5Ri5X14GAgXhaHii3GnPAEERYPJgZJDncDU");
       console.log("Failed to get USDC balance", e);
     }
 
-    if (usdcBalance >= 2000000000 && wrappedSolBalance >= 10 * LAMPORTS_PER_SOL) {
+    if (usdcBalance >= 200000000 && wrappedSolBalance >= 1 * LAMPORTS_PER_SOL) {
     try {
-        await program.methods
-          .depositTokenA(new BN(Date.now()), new BN(wrappedSolBalance - 1), new BN(duration))
+        let swapTx = new Transaction();
+        let swapA = await program.methods
+          .depositTokenA(new BN(Date.now()), new BN(wrappedSolBalance - 10 * LAMPORTS_PER_SOL), new BN(duration))
           .accounts({
             depositor: provider.publicKey,
             tokenMintA: solMint,
@@ -106,9 +220,9 @@ let usdcMint = new PublicKey("4zMMC9srt5Ri5X14GAgXhaHii3GnPAEERYPJgZJDncDU");
             prices: prices,
             tokenProgram: TOKEN_PROGRAM_ID,
           })
-          .rpc();
+          .instruction();
 
-        await program.methods
+        let swapB = await program.methods
           .depositTokenB(new BN(Date.now()), new BN(usdcBalance - 1), new BN(duration))
           .accounts({
             depositor: provider.publicKey,
@@ -117,7 +231,11 @@ let usdcMint = new PublicKey("4zMMC9srt5Ri5X14GAgXhaHii3GnPAEERYPJgZJDncDU");
             prices: prices,
             tokenProgram: TOKEN_PROGRAM_ID,
           })
-          .rpc()
+          .instruction();
+
+          swapTx.add(swapA, swapB);
+
+          await provider.sendAndConfirm(swapTx, [], {skipPreflight: true});
 
 
     } catch (e) {
